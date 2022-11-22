@@ -19,4 +19,5 @@ services:
   - name: "Web Proxy Service"
     type: proxy
     ingress_url: "api.localhost:9000"
+    use_auth: true
     egress_url: "http://localhost:8000/"

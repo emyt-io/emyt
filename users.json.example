@@ -1,0 +1,16 @@
+{
+  "user_nodes": [
+    {
+      "username": "ernesto",
+      "password": "s3cret"
+    },
+    {
+      "username": "cj",
+      "password": "SDTacos"
+    },
+    {
+      "username": "nash",
+      "password": "123Secret"
+    }
+  ]
+}

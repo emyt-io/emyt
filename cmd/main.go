@@ -2,18 +2,23 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
-	"github.com/emyt-io/emyt/config"
-	"github.com/emyt-io/emyt/models"
-	"github.com/ilyakaznacheev/cleanenv"
-	"github.com/labstack/echo/v4"
-	"github.com/labstack/echo/v4/middleware"
-	"gopkg.in/natefinch/lumberjack.v2"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"time"
+
+	"github.com/emyt-io/emyt/config"
+	"github.com/emyt-io/emyt/db"
+	"github.com/emyt-io/emyt/models"
+	"github.com/ilyakaznacheev/cleanenv"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"gopkg.in/natefinch/lumberjack.v2"
+	"gorm.io/gorm"
 )
 
 const AppYamlFilename = "app.yaml"
@@ -31,16 +36,69 @@ func load() config.Config {
 var hosts = map[string]*models.Host{}
 var redirectUrls = map[string]*models.RedirectUrl{}
 
+func customHTTPErrorHandler(err error, c echo.Context) {
+	code := http.StatusInternalServerError
+	if he, ok := err.(*echo.HTTPError); ok {
+		code = he.Code
+	}
+	c.Logger().Error(err)
+
+	if code == 401 {
+		c.Response().Header().Add("X-Authorized", "false")
+		c.Response().Header().Add("X-Next-Page", c.Request().RequestURI)
+	}
+
+	errorPage := fmt.Sprintf("views/%d.html", code)
+	if err := c.File(errorPage); err != nil {
+		c.Logger().Error(err)
+	}
+}
+
 func main() {
+	doSeed := flag.Bool("seed", false, "Seeds the database")
+	flag.Parse()
+
+	if *doSeed {
+		fmt.Println("About to seed the database.")
+		models.JsonSeed()
+
+		fmt.Println("Database seeded. Exiting.")
+		os.Exit(0)
+	}
 
 	// Load ENV
 	cfg := load()
-
+	// Init DB
+	db.Init()
 	// Hosts
 	for _, service := range cfg.Services {
 		// Service Target
 		tenant := echo.New()
 		var targets []*middleware.ProxyTarget
+		skip := !service.UseAuth
+		serviceName := service.Name
+
+		tenant.HTTPErrorHandler = customHTTPErrorHandler
+		tenant.Use(loadAuthorizationHeader)
+		tenant.Use(middleware.BasicAuthWithConfig(middleware.BasicAuthConfig{
+			Skipper: func(ctx echo.Context) bool { return skip },
+			Realm:   serviceName,
+			Validator: func(username, password string, ctx echo.Context) (bool, error) {
+				user, err := models.GetUserByUsername(username)
+				if err != nil {
+					errors.Is(err, gorm.ErrRecordNotFound)
+					return false, echo.ErrUnauthorized
+				}
+
+				err = models.VerifyPassword(user.Password, password)
+				if err != nil {
+					return false, echo.ErrUnauthorized
+				}
+
+				return true, nil
+			},
+		}))
+
 		// Service Config
 		if service.Type == "proxy" {
 			// Web endpoint
@@ -148,6 +206,30 @@ func main() {
 	defer cancel()
 	if err := e.Shutdown(ctx); err != nil {
 		e.Logger.Fatal(err)
+	}
+}
+
+// If the Authorization is not sent as header but present as a cookie, loads it among the headers
+func loadAuthorizationHeader(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		auth := c.Request().Header.Get(echo.HeaderAuthorization)
+		if auth != "" {
+			// Skip if found.
+			return next(c)
+		}
+
+		cookie, err := c.Cookie(echo.HeaderAuthorization)
+		if err != nil {
+			// The soley prupose is copy the header; if we can't then skip.
+			return next(c)
+		}
+
+		if time.Now().Before(cookie.Expires) {
+			return next(c)
+		}
+		c.Request().Header.Set(echo.HeaderAuthorization, cookie.Value)
+
+		return next(c)
 	}
 }
 
